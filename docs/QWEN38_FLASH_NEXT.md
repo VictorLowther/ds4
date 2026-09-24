@@ -233,6 +233,15 @@ Vision and end-to-end checks additionally require the checkpoints above.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` on either backend to check
 failed disk reads during prefill, decode and MTP, then exact recovery.
 
+Prompt rendering is checked without a model. `make test-frontends` runs the Qwen
+renderer assertions, including that a client which spells a tool-schema
+character as an escape on the wire (`\u2014`, or a surrogate pair for an emoji)
+is decoded before it reaches the prompt, the way the template's `tojson` renders
+it, while control characters keep the escaped spelling. Nested schema values are
+copied rather than reparsed, so this is the path where a client's spelling used
+to survive into the prompt and cost six characters where the model was trained
+to see one.
+
 Official Alibaba continuations are tracked for 100 short prompts and 12
 archive/code prompts from 2K to 24K tokens. Build the quality scorer, then run
 from the repository root:
@@ -262,6 +271,24 @@ DS4_TEST_MODEL=/path/to/main-with-mtp.gguf \
     --session-snapshot --session-rewind --session-rewind-resample
 python3 tests/test_qwen4_checkpoint_replay.py \
   --model /path/to/main-with-mtp.gguf
+python3 tests/test_qwen4_reasoning_retention.py \
+  --model /path/to/main-with-mtp.gguf
+```
+
+`test_qwen4_reasoning_retention.py` drives the `preserve_thinking` switch on one
+server run plus a restart: prompt shape, live reuse of a growing retention-off
+loop, restart reuse of the rewritten prefix, and a notice-heavy loop that counts
+the meta-commentary class the archive used to replay. Artifacts (server log,
+trace, per-request JSON) land in `--out`, and it prints which check answered the
+checkpoint-key question, so a failure can be read without re-running the model.
+On the release checkpoint a ten-turn loop measured 2053 to 1216 prompt tokens,
+with 1279 of 1281 tokens reused from the live session and 1281 of 1281 from disk
+after a restart, so the checkpoint key is not gated on the switch. Arms that
+judge reuse report INCONCLUSIVE rather than FAIL when the setup cannot settle
+them, which includes a frontier turn that ended truncated: an unclosed reasoning
+chain cannot be replayed into the next request.
+
+```sh
 python3 tests/test_qwen4_mtp_limits.py \
   --model /path/to/main-with-mtp.gguf
 python3 tests/test_qwen4_logit_dump.py \
