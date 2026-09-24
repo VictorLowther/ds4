@@ -277,16 +277,21 @@ python3 tests/test_qwen4_reasoning_retention.py \
 
 `test_qwen4_reasoning_retention.py` drives the `preserve_thinking` switch on one
 server run plus a restart: prompt shape, live reuse of a growing retention-off
-loop, restart reuse of the rewritten prefix, and a notice-heavy loop that counts
-the meta-commentary class the archive used to replay. Artifacts (server log,
-trace, per-request JSON) land in `--out`, and it prints which check answered the
-checkpoint-key question, so a failure can be read without re-running the model.
-On the release checkpoint a ten-turn loop measured 2053 to 1216 prompt tokens,
-with 1279 of 1281 tokens reused from the live session and 1281 of 1281 from disk
-after a restart, so the checkpoint key is not gated on the switch. Arms that
-judge reuse report INCONCLUSIVE rather than FAIL when the setup cannot settle
-them, which includes a frontier turn that ended truncated: an unclosed reasoning
-chain cannot be replayed into the next request.
+loop, restart reuse by a continuation of that loop, and a notice-heavy loop that
+counts the meta-commentary class the archive used to replay. Artifacts (server
+log, trace, per-request JSON) land in `--out`, and it prints which check answered
+the checkpoint-key question, so a failure can be read without re-running the
+model. On the release checkpoint a ten-turn loop measured 2053 to 1216 prompt
+tokens, with 1279 of 1281 tokens reused from the live session and 1281 of 1281
+from disk after a restart; the six-turn reproduction reuses 1229 of 1252 from
+disk. That settles that a continuation needs no new key, not that the key ignores
+the switch: `build_thinking_visible_text` keys a retention-off checkpoint by the
+visible transcript, which renders the frontier turn with an empty reasoning body,
+so a client that echoes `reasoning_content` back reuses the live prefix through
+the exact-token tier and still re-prefills from disk. Arms that judge reuse
+report INCONCLUSIVE rather than FAIL when the setup cannot settle them, which
+includes a frontier turn that ended truncated: an unclosed reasoning chain
+cannot be replayed into the next request.
 
 ```sh
 python3 tests/test_qwen4_mtp_limits.py \

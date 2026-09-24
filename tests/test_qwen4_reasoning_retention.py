@@ -9,9 +9,11 @@ A  prompt shape      retention off must remove pre-window reasoning from the
                      rendered prompt and from prompt_tokens.
 B  cache stability   turning retention off rewrites the stable prefix, so the
                      first request must miss once and the next must hit.
-C  restart reuse     after a restart the retention-off history must reuse the
-                     disk checkpoint.  This is the pass/fail signal for gating
-                     prompt_preserves_reasoning on the retention switch.
+C  restart reuse     after a restart, a continuation of the retention-off loop
+                     -- replayed without round-tripping the frontier reasoning,
+                     which is the shape the checkpoint key is built for -- must
+                     reuse the disk checkpoint.  This is the pass/fail signal for
+                     gating prompt_preserves_reasoning on the retention switch.
 D  symptom replay    harness-style notice-only user turns over several turns;
                      counts the "the user has sent / hasn't asked anything"
                      meta-commentary class in returned reasoning, on vs off.
@@ -103,6 +105,83 @@ def usage_of(result):
     usage = result.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
     return int(usage.get("prompt_tokens") or 0), int(details.get("cached_tokens") or 0)
+
+
+TOOL_NOTE = "archives total 462 segments"
+
+
+def finished(result):
+    """A truncated chain cannot be replayed: the KV holds an unclosed reasoning
+    block, so re-rendering it as a closed one diverges at the very first appended
+    token and every reuse check after that measures nothing."""
+    return (result.get("choices") or [{}])[0].get("finish_reason") != "length"
+
+
+def extend(messages, result, keep_reasoning=True):
+    """Append the frontier turn `result` actually produced, then a tool output.
+
+    This is how an agent loop grows.  keep_reasoning=False drops the reasoning
+    body, which is what a client that does not round-trip thinking sends -- and
+    the only shape a visible-transcript checkpoint key can match: the key is
+    built as the render with an empty think block plus the trimmed content, so a
+    replay that carries the reasoning text again never hashes to it."""
+    choice = (result.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    calls = message.get("tool_calls") or []
+    out = list(messages)
+    out.append({"role": "assistant",
+                "content": message.get("content") or "",
+                "reasoning_content": (message.get("reasoning_content") or "")
+                                     if keep_reasoning else "",
+                **({"tool_calls": calls} if calls else {})})
+    for call in calls:
+        out.append({"role": "tool", "tool_call_id": (call or {}).get("id", "c"),
+                    "content": TOOL_NOTE})
+    return out
+
+
+def miss_note(tracepath, cache, cached):
+    """Why nothing was reused, as far as the artifacts can say.
+
+    A disk hit is found by hashing the first key_bytes of the request render, so
+    a render shorter than every key, or a render whose bytes at that length are
+    not the stored key, both land on 'reused nothing' with no server-side trace.
+    """
+    if cached:
+        return ""
+    rendered = (parse_trace(tracepath) or [{}])[-1].get("prompt", "")
+    render_bytes = len(rendered.encode())
+    keys = kv_entries(cache)
+    note = ("; render=" + str(render_bytes) + "B, keys on disk "
+            + (", ".join(f"{name}={nbytes}B" for name, _t, nbytes in keys) or "none"))
+    if keys and all(nbytes > render_bytes for _n, _t, nbytes in keys):
+        note += " - every key is longer than the render, so none was a candidate"
+    return note
+
+
+KV_FIXED_HEADER = 48
+
+
+def kv_entries(cache):
+    """(name, tokens, key_bytes) per checkpoint file, read from its header.
+
+    A disk hit is found by hashing the first key_bytes of the request render, so
+    an entry whose key is longer than that render is never even opened.  Without
+    this, a total miss looks like an evicted or corrupt cache."""
+    entries = []
+    for path in sorted(pathlib.Path(cache).glob("*.kv")):
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(KV_FIXED_HEADER + 4)
+        except OSError:
+            continue
+        if len(head) < KV_FIXED_HEADER + 4:
+            continue
+        entries.append((path.name[:12],
+                        int.from_bytes(head[8:12], "little"),
+                        int.from_bytes(head[KV_FIXED_HEADER:KV_FIXED_HEADER + 4],
+                                       "little")))
+    return entries
 
 
 def tool_defs():
@@ -235,7 +314,8 @@ def main():
             stale.unlink()
     cmd = [str((root / args.binary).resolve()), "-m", str(pathlib.Path(args.model).resolve()),
            "--ctx", args.ctx, "--port", str(port), "--prefill-chunk", "1024",
-           "--kv-disk-dir", str(cache), "--kv-disk-space-mb", "512",
+           "--kv-disk-dir", str(cache), "--kv-disk-space-mb",
+           str(args.kv_disk_space_mb),
            "--kv-cache-min-tokens", "128", "--kv-cache-cold-max-tokens", "0",
            "--kv-cache-boundary-align-tokens", "128", "--trace", str(tracepath)]
     # Frontier turns must finish: a truncated chain cannot be replayed into the
@@ -288,19 +368,13 @@ def main():
         # produced, and that turn has to have finished.  A truncated chain cannot
         # be replayed: the live KV holds an unclosed reasoning block, so
         # re-rendering it as a closed block diverges at the very first appended
-        # token and every reuse check after that measures nothing.
-        answered = off["choices"][0]["message"] or {}
-        answer_calls = answered.get("tool_calls") or []
-        replayable = off["choices"][0].get("finish_reason") == "stop"
-        grown = list(history)
-        grown.append({"role": "assistant",
-                      "content": answered.get("content") or "",
-                      "reasoning_content": answered.get("reasoning_content") or "",
-                      **({"tool_calls": answer_calls} if answer_calls else {})})
-        for call in answer_calls:
-            grown.append({"role": "tool", "tool_call_id": (call or {}).get("id", "c"),
-                          "content": "archives total 462 segments"})
+        # token and every reuse check after that measures nothing.  A tool call is
+        # a finished turn, and it is the shape a real agent loop replays, so only
+        # finish=length blocks the arm.
+        replayable = finished(off)
+        grown = extend(history, off)
         grown_prompt = ""
+        nxt = {}
         nxt_tokens = nxt_cached = 0
         if replayable:
             nxt = chat(base, model, grown, tools, False, args.effort, turn_max)
@@ -329,23 +403,58 @@ def main():
         proc = subprocess.Popen(cmd, cwd=root, stdout=log, stderr=log)
         model = wait_ready(proc, base, args.ready_timeout)
         log.flush()
-        thrashed = "disk-cache-full" in logpath.read_text(errors="replace")
+        logtext = logpath.read_text(errors="replace")
+        budget = re.search(r"KV disk cache .*?budget=(\d+) MiB", logtext)
+        thrashed = "disk-cache-full" in logtext
         checks.add("C0 disk budget kept the checkpoint until the restart",
-                   not thrashed, f"budget={args.kv_disk_space_mb} MiB",
+                   not thrashed,
+                   f"server reported budget={budget.group(1) if budget else '?'} MiB "
+                   f"(asked {args.kv_disk_space_mb})",
                    inconclusive=thrashed)
-        # Reuse the loop state that was actually checkpointed (the grown history),
-        # not the earlier one: retention renders those two differently, so the
-        # shorter history is not a prefix of what the checkpoint holds.
-        cold = chat(base, model, grown, tools, False, args.effort, turn_max)
-        cold_tokens, cold_cached = usage_of(cold)
+        # Two things have to be true for this replay to be able to hit, and the
+        # first run of this arm failed on both:
+        #
+        # 1. The request must be longer than the checkpoint's key.  The shutdown
+        #    store holds the state the grown request *produced*, keyed by the
+        #    transcript that includes the answer it generated, so replaying the
+        #    grown request itself presents a render a couple hundred bytes
+        #    shorter than the key it is looking for.  find_text_prefix() only
+        #    considers keys that fit inside the render, skips everything, opens
+        #    no file and logs nothing.
+        # 2. The replay must render that frontier turn the way the key renders
+        #    it.  build_thinking_visible_text() says so in its own comment: the
+        #    key is the render plus an empty think block and the trimmed content.
+        #    A client that round-trips thinking replays the reasoning text
+        #    instead, and with retention off the renderer keeps the frontier
+        #    body, so the hashes part company at the first byte of that body.
+        #    That is the shape this arm now does not use: the same continuation
+        #    with reasoning_content resent measured cached=0 of 1252 on a fresh
+        #    server while reusing the live prefix fine (B1) -- live reuse goes
+        #    through the exact-token-prefix tier, which has no such key.
+        #
+        # So: replay the continuation the way a client that does not round-trip
+        # thinking sends it.  If this misses too, the visible-transcript key is
+        # unreachable for retention-off sessions and the key kind needs to follow
+        # the switch rather than the request flag.
+        replayable_after = replayable and finished(nxt)
+        after = extend(grown, nxt, keep_reasoning=False)
+        cold_tokens = cold_cached = 0
+        if replayable_after:
+            cold = chat(base, model, after, tools, False, args.effort, turn_max)
+            cold_tokens, cold_cached = usage_of(cold)
+        detail = (f"cached={cold_cached}/{cold_tokens} of {len(after)} msgs"
+                  + miss_note(tracepaths[1], cache, cold_cached))
         # A hit is a hit: the checkpoint key question is settled by the reuse
-        # itself.  Only an eviction with nothing reused leaves it undecidable.
-        undecidable = thrashed and cold_cached == 0
-        checks.add("C1 retention-off history reuses the disk checkpoint after restart",
-                   cold_cached > 0,
-                   f"cached={cold_cached}/{cold_tokens} of {len(grown)} msgs"
-                   + (" - undecidable, checkpoint was evicted first" if undecidable else ""),
-                   inconclusive=undecidable)
+        # itself.  Nothing reused because the budget evicted the checkpoint, or
+        # because there was no replayable frontier to extend, is undecidable
+        # rather than a failure.
+        undecidable = (not replayable_after) or (thrashed and cold_cached == 0)
+        if not replayable_after:
+            detail += " - undecidable, no replayable frontier to extend"
+        elif thrashed and cold_cached == 0:
+            detail += " - undecidable, checkpoint was evicted first"
+        checks.add("C1 retention-off continuation reuses the disk checkpoint after restart",
+                   replayable_after and cold_cached > 0, detail, inconclusive=undecidable)
 
         # ---- D: symptom replay ---------------------------------------------
         if not args.skip_symptom:
@@ -404,7 +513,9 @@ def main():
           f"inconclusive={len(inconclusive)} artifacts={out}")
     print("Interpretation: C1 decides whether to gate prompt_preserves_reasoning "
           "on the retention switch. A pass means restart reuse is fine as-is; a fail "
-          "means the checkpoint key must follow the switch.")
+          "means the checkpoint key must follow the switch -- but read the printed key "
+          "lengths first, because a render shorter than every key on disk reuses "
+          "nothing for reasons that have nothing to do with the switch.")
     return 1 if failed else 0
 
 
